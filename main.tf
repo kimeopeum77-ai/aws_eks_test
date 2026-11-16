@@ -41,7 +41,7 @@ provider "kubernetes" {
 
 # AWS EKS Cluster
 data "aws_iam_user" "EKS_Admin_ID" {
-  user_name = "admin"
+  user_name = "rec0n"
 }
 
 module "aws_eks_cluster" {
@@ -51,7 +51,7 @@ module "aws_eks_cluster" {
   private_subnets  = ["192.168.10.0/24", "192.168.20.0/24"]
   database_subnets = ["192.168.30.0/24", "192.168.40.0/24"]
   cluster_name     = "my-eks"
-  cluster_version  = "1.32"
+  cluster_version  = "1.37" # 최신 표준 지원 버전 (확인: aws eks describe-cluster-versions)
   cluster_admin    = data.aws_iam_user.EKS_Admin_ID.user_id
 }
 

@@ -74,7 +74,7 @@ resource "aws_eip" "BastionHost_eip" {
 
 # BastionHost Key-Pair DataSource
 data "aws_key_pair" "EC2-Key" {
-  key_name = "EC2-key"
+  key_name = "EC2-Key"
 }
 
 # BastionHost Instance
@@ -216,6 +216,9 @@ module "eks" {
   # EKS Worker Node 정의 ( ManagedNode방식 / Launch Template 자동 구성 )
   eks_managed_node_groups = {
     EKS_Worker_Node = {
+      # Kubernetes 1.33부터 Amazon Linux 2(AL2) AMI가 없으므로 AL2023 AMI를 지정
+      # (EKS 모듈 v20의 기본값은 AL2_x86_64라서 지정하지 않으면 노드 그룹 생성이 실패함)
+      ami_type       = "AL2023_x86_64_STANDARD"
       instance_types = ["t3.small"]
       min_size       = 2
       max_size       = 3
