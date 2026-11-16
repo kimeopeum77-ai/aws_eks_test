@@ -97,6 +97,99 @@ data "aws_key_pair" "EC2-Key" {
   key_name = "EC2-Key"
 }
 
+# =================================================================================================
+# BastionHost IAM Role
+#  - Bastion에서 kubectl / k9s로 EKS에 접속하려면 AWS 자격 증명이 필요합니다.
+#  - 액세스 키를 인스턴스에 넣지 않고, IAM Role(Instance Profile)을 붙여 임시 자격 증명을 자동으로 받습니다.
+#  - 이 Role은 아래 EKS 모듈의 access_entries에서 클러스터 관리자 권한을 받습니다.
+# =================================================================================================
+resource "aws_iam_role" "BastionHost_role" {
+  name = "${local.cluster_name}-bastion-role"
+
+  # EC2 인스턴스가 이 Role을 사용할 수 있도록 허용 (Trust Policy)
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+# aws eks update-kubeconfig 실행에 필요한 최소 권한 (이 클러스터 조회만 허용)
+resource "aws_iam_role_policy" "BastionHost_eks_describe" {
+  name = "eks-describe-cluster"
+  role = aws_iam_role.BastionHost_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["eks:DescribeCluster"]
+      Resource = module.eks.cluster_arn
+    }]
+  })
+}
+
+# EC2에 IAM Role을 붙이기 위한 Instance Profile
+resource "aws_iam_instance_profile" "BastionHost_profile" {
+  name = "${local.cluster_name}-bastion-profile"
+  role = aws_iam_role.BastionHost_role.name
+}
+
+# BastionHost 부팅 스크립트 (user_data)
+#  - 실행 로그: Bastion에서 /var/log/bastion-init.log
+locals {
+  bastion_user_data = <<-EOF
+    #!/bin/bash
+    set -euxo pipefail
+    exec > /var/log/bastion-init.log 2>&1
+
+    # 1) kubectl - 클러스터 버전(${local.cluster_version})과 같은 마이너 버전의 최신 패치를 설치
+    #    (kubectl은 클러스터와 마이너 버전 ±1까지만 지원)
+    KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable-${local.cluster_version}.txt)
+    curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl"
+    curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl.sha256"
+    echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum --check   # 체크섬 검증
+    chmod +x /usr/local/bin/kubectl
+
+    # 2) k9s - GitHub 최신 릴리스 설치
+    curl -fsSL https://github.com/derailed/k9s/releases/latest/download/k9s_Linux_amd64.tar.gz | tar -xz -C /usr/local/bin k9s
+    chmod +x /usr/local/bin/k9s
+
+    # 3) ec2-user의 kubeconfig에 EKS 클러스터 등록 (IAM Role 자격 증명 사용, alias로 짧은 이름 지정)
+    sudo -u ec2-user aws eks update-kubeconfig --region ${local.region} --name ${local.cluster_name} --alias ${local.cluster_name}
+
+    # 4) 편의 설정 - kubectl 자동완성 + 'k' 별칭
+    cat >> /home/ec2-user/.bashrc <<'BASHRC'
+    source <(kubectl completion bash)
+    alias k=kubectl
+    complete -o default -F __start_kubectl k
+    BASHRC
+  EOF
+
+  # NAT 인스턴스 부팅 스크립트 - IP 포워딩 + iptables MASQUERADE
+  nat_user_data = <<-EOF
+    #!/bin/bash
+    # 1) 커널 IP 포워딩 활성화 (재부팅 후에도 유지)
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/90-nat.conf
+    sysctl -p /etc/sysctl.d/90-nat.conf
+
+    # 2) iptables 설치 - EIP가 붙기 전에는 인터넷이 안 되므로 성공할 때까지 재시도
+    until dnf install -y iptables-services; do sleep 10; done
+
+    # 3) VPC 대역(${local.cidr})에서 나가는 트래픽을 NAT 인스턴스 IP로 변환(MASQUERADE)
+    IFACE=$(ip route show default | awk '{print $5}' | head -n1)
+    iptables -t nat -A POSTROUTING -o "$IFACE" -s ${local.cidr} -j MASQUERADE
+    iptables -F FORWARD
+
+    # 4) 규칙 저장 후 iptables 서비스 활성화 (재부팅 후에도 규칙 유지)
+    service iptables save
+    systemctl enable --now iptables
+  EOF
+}
+
 # BastionHost Instance
 # EKS Cluster SG : module.eks.cluster_primary_security_group_id
 #  - 예전에는 data "aws_eks_cluster"로 다시 조회했지만, EKS 모듈이 같은 값을 Output으로 주므로 바로 참조합니다.
@@ -108,7 +201,17 @@ resource "aws_instance" "BastionHost" {
   subnet_id                   = module.vpc.public_subnets[1]
   associate_public_ip_address = true
   vpc_security_group_ids      = [module.BastionHost_SG.security_group_id, module.eks.cluster_primary_security_group_id]
+  iam_instance_profile        = aws_iam_instance_profile.BastionHost_profile.name
   depends_on                  = [module.eks]
+
+  # 부팅 시 kubectl / k9s 설치 + kubeconfig 등록 (처음 부팅할 때 한 번만 실행됨)
+  #  - 실행 로그: /var/log/bastion-init.log
+  #  - user_data는 처음 부팅 때만 실행되므로, 내용을 바꾸면 인스턴스를 새로 만들도록 설정 (user_data_replace_on_change)
+  #  - 스크립트 내용은 아래 locals의 bastion_user_data 참고
+  #  - replace(..., "\r", ""): Windows에서 파일이 CRLF로 저장돼도 Linux에서 스크립트가 실행되도록 \r 제거
+  user_data_replace_on_change = true
+  user_data                   = replace(local.bastion_user_data, "\r", "")
+
   tags = {
     Name = "BastionHost_Instance"
   }
@@ -178,24 +281,9 @@ resource "aws_instance" "NAT_Instance" {
     device_index         = 0
   }
 
-  user_data = <<-EOF
-    #!/bin/bash
-    # 1) 커널 IP 포워딩 활성화 (재부팅 후에도 유지)
-    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/90-nat.conf
-    sysctl -p /etc/sysctl.d/90-nat.conf
-
-    # 2) iptables 설치 - EIP가 붙기 전에는 인터넷이 안 되므로 성공할 때까지 재시도
-    until dnf install -y iptables-services; do sleep 10; done
-
-    # 3) VPC 대역(${local.cidr})에서 나가는 트래픽을 NAT 인스턴스 IP로 변환(MASQUERADE)
-    IFACE=$(ip route show default | awk '{print $5}' | head -n1)
-    iptables -t nat -A POSTROUTING -o "$IFACE" -s ${local.cidr} -j MASQUERADE
-    iptables -F FORWARD
-
-    # 4) 규칙 저장 후 iptables 서비스 활성화 (재부팅 후에도 규칙 유지)
-    service iptables save
-    systemctl enable --now iptables
-  EOF
+  # 스크립트 내용은 위 locals의 nat_user_data 참고
+  # replace(..., "\r", ""): Windows에서 파일이 CRLF로 저장돼도 Linux에서 스크립트가 실행되도록 \r 제거
+  user_data = replace(local.nat_user_data, "\r", "")
 
   tags = {
     Name = "NAT_Instance"
@@ -278,6 +366,21 @@ module "eks" {
 
   # K8s ConfigMap Object "aws_auth" 구성
   enable_cluster_creator_admin_permissions = true
+
+  # BastionHost IAM Role에 클러스터 관리자 권한 부여 (EKS Access Entry 방식)
+  #  - 예전에는 aws-auth ConfigMap을 직접 수정했지만, 지금은 EKS API의 Access Entry로 권한을 줍니다.
+  #  - 실습용이라 관리자(AmazonEKSClusterAdminPolicy)를 주며, 조회만 필요하면 AmazonEKSViewPolicy로 낮추면 됩니다.
+  access_entries = {
+    bastion = {
+      principal_arn = aws_iam_role.BastionHost_role.arn
+      policy_associations = {
+        cluster_admin = {
+          policy_arn   = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          access_scope = { type = "cluster" }
+        }
+      }
+    }
+  }
 }
 
 # 서브넷 태그(AWS Load Balancer Controller용)는 위 VPC 모듈의 public_subnet_tags / private_subnet_tags로 옮겼습니다.
