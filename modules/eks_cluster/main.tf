@@ -1,3 +1,15 @@
+# 이 모듈이 쓰는 Provider와 버전 범위를 명시합니다.
+# (명시하지 않으면 버전 제약 없이 최신 버전이 설치될 수 있음)
+# EKS 모듈 v20이 aws provider 5.95 이상 6.0 미만을 요구하므로 같은 범위로 맞춥니다.
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.95, < 6.0"
+    }
+  }
+}
+
 # VPC
 module "vpc" {
   source           = "terraform-aws-modules/vpc/aws"
@@ -9,8 +21,9 @@ module "vpc" {
   private_subnets  = local.private_subnets
   database_subnets = local.database_subnets
 
-  enable_dns_hostnames = "true"
-  enable_dns_support   = "true"
+  # bool 값은 문자열("true")이 아닌 true / false로 작성 (문자열 bool은 Terraform 0.11 시절 문법)
+  enable_dns_hostnames = true
+  enable_dns_support   = true
   tags = {
     "TerraformManaged" = "true"
   }
@@ -23,7 +36,7 @@ module "BastionHost_SG" {
   name            = "BastionHost_SG"
   description     = "BastionHost_SG"
   vpc_id          = module.vpc.vpc_id
-  use_name_prefix = "false"
+  use_name_prefix = false
 
   ingress_with_cidr_blocks = [
     {
@@ -65,14 +78,16 @@ data "aws_key_pair" "EC2-Key" {
 }
 
 # BastionHost Instance
-# EKS Cluster SG : data.aws_eks_cluster.cluster.vpc_config[0].cluster_security_group_id 
+# EKS Cluster SG : module.eks.cluster_primary_security_group_id
+#  - 예전에는 data "aws_eks_cluster"로 다시 조회했지만, EKS 모듈이 같은 값을 Output으로 주므로 바로 참조합니다.
+#  - data source + depends_on 조합은 plan 단계에서 값을 못 읽고 apply 때로 미뤄지는 문제가 있습니다.
 resource "aws_instance" "BastionHost" {
   ami                         = "ami-0eb63419e063fe627"
   instance_type               = "t3.small"
   key_name                    = data.aws_key_pair.EC2-Key.key_name
   subnet_id                   = module.vpc.public_subnets[1]
   associate_public_ip_address = true
-  vpc_security_group_ids      = [module.BastionHost_SG.security_group_id, data.aws_eks_cluster.cluster.vpc_config[0].cluster_security_group_id]
+  vpc_security_group_ids      = [module.BastionHost_SG.security_group_id, module.eks.cluster_primary_security_group_id]
   depends_on                  = [module.eks]
   tags = {
     Name = "BastionHost_Instance"
@@ -86,7 +101,7 @@ module "NAT_SG" {
   name            = "NAT_SG"
   description     = "All Traffic"
   vpc_id          = module.vpc.vpc_id
-  use_name_prefix = "false"
+  use_name_prefix = false
 
   ingress_with_cidr_blocks = [
     {
@@ -178,34 +193,11 @@ resource "aws_route" "private_subnet_2" {
 # =================================================================================================
 # =================================================================================================
 
-/* 
-  # Kubernetes 추가 Provider
-  EKS Cluster 구성 후 초기 구성 작업을 수행하기 위한 Terraform Kubernetes Provider 설정 
-  생성 된 EKS Cluster의 EndPoint 주소 및 인증정보등을 DataSource로 정의 후 Provider 설정 정보로 입력
- */
-
-# AWS EKS Cluster Data Source
-data "aws_eks_cluster" "cluster" {
-  name       = module.eks.cluster_name
-  depends_on = [module.eks]
-}
-
-# AWS EKS Cluster Auth Data Source
-data "aws_eks_cluster_auth" "cluster" {
-  name       = module.eks.cluster_name
-  depends_on = [module.eks]
-}
-
-# AWS EKS Cluster DataSource DOCS 
-# - aws_eks_cluster      : https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/eks_cluster.html
-# - aws_eks_cluster_auth : https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/eks_cluster_auth
-
-
-provider "kubernetes" {
-  host                   = data.aws_eks_cluster.cluster.endpoint
-  cluster_ca_certificate = base64decode(data.aws_eks_cluster.cluster.certificate_authority.0.data)
-  token                  = data.aws_eks_cluster_auth.cluster.token
-}
+# Kubernetes Provider는 루트 main.tf로 옮겼습니다 (모듈 안에는 provider 블록을 두지 않음).
+#  - 모듈 안에 provider가 있으면 이 모듈을 호출할 때 count / for_each / depends_on을 쓸 수 없고,
+#    모듈을 삭제(destroy)할 때 provider 설정이 먼저 사라져 오류가 나기 쉽습니다.
+# 루트에서 쓸 EKS 접속 정보는 outputs.tf의 cluster_name / cluster_endpoint / cluster_certificate_authority_data로 내보냅니다.
+# (예전 문법 참고: certificate_authority.0.data → 지금은 [0] 인덱스 문법 사용)
 
 # Terraform EKS Module DOCS : https://registry.terraform.io/modules/terraform-aws-modules/eks/aws/latest
 module "eks" {

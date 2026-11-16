@@ -1,3 +1,13 @@
+# 이 모듈이 쓰는 Provider와 버전 범위를 명시 (루트와 같은 aws 5.x)
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
 # RDS SG
 module "RDS_SG" {
   source          = "terraform-aws-modules/security-group/aws"
@@ -5,7 +15,7 @@ module "RDS_SG" {
   name            = "RDS_SG"
   description     = "DB Port Allow"
   vpc_id          = data.terraform_remote_state.vpc_remote_data.outputs.vpc_id
-  use_name_prefix = "false"
+  use_name_prefix = false # bool 값은 문자열("false")이 아닌 false로 작성
 
   ingress_with_cidr_blocks = [
     {

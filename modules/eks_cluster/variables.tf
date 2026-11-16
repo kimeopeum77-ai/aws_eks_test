@@ -25,19 +25,20 @@ variable "cidr" {
   type        = string
 }
 
+# 서브넷 목록은 CIDR 문자열 목록이므로 list(any) 대신 list(string)으로 타입을 명확히 지정
 variable "public_subnets" {
   description = "VPC Public Subnets"
-  type        = list(any)
+  type        = list(string)
 }
 
 variable "private_subnets" {
   description = "VPC Private Subnets"
-  type        = list(any)
+  type        = list(string)
 }
 
 variable "database_subnets" {
   description = "VPC Database Subnets"
-  type        = list(any)
+  type        = list(string)
 }
 
 variable "cluster_name" {

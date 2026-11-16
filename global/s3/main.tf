@@ -19,9 +19,10 @@ resource "aws_s3_bucket" "terraform_state" {
   tags = {
     Name = "terraform_state"
   }
-  lifecycle {
-    #prevent_destroy = true
-  }
+  # 삭제 방지가 필요하면 아래 블록을 추가 (내용 없는 빈 lifecycle 블록은 제거함)
+  # lifecycle {
+  #   prevent_destroy = true
+  # }
   force_destroy = true
 }
 

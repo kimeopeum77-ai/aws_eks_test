@@ -1,12 +1,12 @@
 # Terraform 초기구성
 terraform {
   backend "s3" {
-    bucket         = "myterraform-bucket-state-choi-t2"
-    key            = "aws_eks/terraform.tfstate"
-    region         = "ap-northeast-2"
-    profile        = "admin_user"
-    dynamodb_table = "myTerraform-bucket-lock-choi-t"
-    encrypt        = true
+    bucket       = "myterraform-bucket-state-mooneks"
+    key          = "aws_eks/terraform.tfstate"
+    region       = "ap-northeast-2"
+    profile      = "admin_user"
+    use_lockfile = true # S3 자체 잠금 (dynamodb_table 방식은 Terraform 1.11부터 deprecated)
+    encrypt      = true
   }
 
   required_providers {
@@ -14,12 +14,29 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 3.0"
+    }
   }
 }
 
 provider "aws" {
   region  = "ap-northeast-2"
-  profile = "admin_user"
+  profile = "admin_user_tf" # aws login 프로필(admin_user)을 credential_process로 감싼 프로필
+}
+
+# Kubernetes Provider
+# EKS Cluster 구성 후 초기 구성 작업을 수행하기 위한 Terraform Kubernetes Provider 설정
+# 생성 된 EKS Cluster의 EndPoint 주소 및 인증정보를 모듈 Output으로 받아 Provider 설정 정보로 입력
+data "aws_eks_cluster_auth" "cluster" {
+  name = module.aws_eks_cluster.cluster_name
+}
+
+provider "kubernetes" {
+  host                   = module.aws_eks_cluster.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.aws_eks_cluster.cluster_certificate_authority_data)
+  token                  = data.aws_eks_cluster_auth.cluster.token
 }
 
 # AWS EKS Cluster
