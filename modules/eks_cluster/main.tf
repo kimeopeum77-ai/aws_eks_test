@@ -72,6 +72,14 @@ resource "aws_eip" "BastionHost_eip" {
   }
 }
 
+# 최신 Amazon Linux 2023 AMI ID (AWS가 SSM Parameter로 제공하는 공식 값)
+#  - AMI ID를 직접 적으면 시간이 지나 AMI가 deprecated / 삭제될 때 apply가 실패하므로 항상 최신 값을 조회합니다.
+#  - AMI ID는 비밀 값이 아니므로 insecure_value 사용 (value를 쓰면 plan에 (sensitive value)로 가려짐)
+#  - 확인 명령: aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+data "aws_ssm_parameter" "al2023_ami" {
+  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+}
+
 # BastionHost Key-Pair DataSource
 data "aws_key_pair" "EC2-Key" {
   key_name = "EC2-Key"
@@ -82,7 +90,7 @@ data "aws_key_pair" "EC2-Key" {
 #  - 예전에는 data "aws_eks_cluster"로 다시 조회했지만, EKS 모듈이 같은 값을 Output으로 주므로 바로 참조합니다.
 #  - data source + depends_on 조합은 plan 단계에서 값을 못 읽고 apply 때로 미뤄지는 문제가 있습니다.
 resource "aws_instance" "BastionHost" {
-  ami                         = "ami-0eb63419e063fe627"
+  ami                         = data.aws_ssm_parameter.al2023_ami.insecure_value
   instance_type               = "t3.small"
   key_name                    = data.aws_key_pair.EC2-Key.key_name
   subnet_id                   = module.vpc.public_subnets[1]
@@ -91,6 +99,11 @@ resource "aws_instance" "BastionHost" {
   depends_on                  = [module.eks]
   tags = {
     Name = "BastionHost_Instance"
+  }
+
+  # 새 AMI가 나올 때마다 인스턴스가 재생성되지 않도록 AMI 변경은 무시
+  lifecycle {
+    ignore_changes = [ami]
   }
 }
 
@@ -139,9 +152,12 @@ resource "aws_network_interface" "NAT_ENI" {
   }
 }
 
-# NAT Instance 
+# NAT Instance
+#  - 예전 NAT 전용 AMI(amzn-ami-vpc-nat, Amazon Linux 1)는 2023-11에 deprecated 되어 더 이상 쓸 수 없습니다.
+#  - 대신 Amazon Linux 2023 AMI를 쓰고, 부팅 시 user_data로 NAT 기능(IP 포워딩 + iptables MASQUERADE)을 켭니다.
+#  - NAT가 동작하려면 ENI의 source_dest_check = false 설정도 필요합니다 (위 NAT_ENI에 설정되어 있음).
 resource "aws_instance" "NAT_Instance" {
-  ami           = "ami-00295862c013bede0"
+  ami           = data.aws_ssm_parameter.al2023_ami.insecure_value
   instance_type = "t2.micro"
   depends_on    = [aws_network_interface.NAT_ENI]
 
@@ -150,8 +166,32 @@ resource "aws_instance" "NAT_Instance" {
     device_index         = 0
   }
 
+  user_data = <<-EOF
+    #!/bin/bash
+    # 1) 커널 IP 포워딩 활성화 (재부팅 후에도 유지)
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/90-nat.conf
+    sysctl -p /etc/sysctl.d/90-nat.conf
+
+    # 2) iptables 설치 - EIP가 붙기 전에는 인터넷이 안 되므로 성공할 때까지 재시도
+    until dnf install -y iptables-services; do sleep 10; done
+
+    # 3) VPC 대역(${local.cidr})에서 나가는 트래픽을 NAT 인스턴스 IP로 변환(MASQUERADE)
+    IFACE=$(ip route show default | awk '{print $5}' | head -n1)
+    iptables -t nat -A POSTROUTING -o "$IFACE" -s ${local.cidr} -j MASQUERADE
+    iptables -F FORWARD
+
+    # 4) 규칙 저장 후 iptables 서비스 활성화 (재부팅 후에도 규칙 유지)
+    service iptables save
+    systemctl enable --now iptables
+  EOF
+
   tags = {
     Name = "NAT_Instance"
+  }
+
+  # 새 AMI가 나올 때마다 인스턴스가 재생성되지 않도록 AMI 변경은 무시
+  lifecycle {
+    ignore_changes = [ami]
   }
 }
 
