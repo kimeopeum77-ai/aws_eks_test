@@ -24,6 +24,18 @@ module "vpc" {
   # bool 값은 문자열("true")이 아닌 true / false로 작성 (문자열 bool은 Terraform 0.11 시절 문법)
   enable_dns_hostnames = true
   enable_dns_support   = true
+
+  # AWS Load Balancer Controller가 서브넷을 찾을 때 쓰는 태그
+  #  - 예전에는 아래쪽 aws_ec2_tag 리소스로 따로 붙였지만, VPC 모듈이 자기가 모르는 태그를 apply 때마다 지우려고 해서
+  #    서브넷이 매번 "변경됨"으로 나오고, 그 여파로 NAT 경로(aws_route)까지 재생성되는 문제가 있었습니다.
+  #  - VPC 모듈의 public_subnet_tags / private_subnet_tags로 넣으면 한 곳에서만 관리되어 충돌이 없습니다.
+  public_subnet_tags = {
+    "kubernetes.io/role/elb" = "1" # internet-facing 로드밸런서용
+  }
+  private_subnet_tags = {
+    "kubernetes.io/role/internal-elb" = "1" # internal 로드밸런서용
+  }
+
   tags = {
     "TerraformManaged" = "true"
   }
@@ -91,7 +103,7 @@ data "aws_key_pair" "EC2-Key" {
 #  - data source + depends_on 조합은 plan 단계에서 값을 못 읽고 apply 때로 미뤄지는 문제가 있습니다.
 resource "aws_instance" "BastionHost" {
   ami                         = data.aws_ssm_parameter.al2023_ami.insecure_value
-  instance_type               = "t3.small"
+  instance_type               = "t3.medium"
   key_name                    = data.aws_key_pair.EC2-Key.key_name
   subnet_id                   = module.vpc.public_subnets[1]
   associate_public_ip_address = true
@@ -205,25 +217,20 @@ resource "aws_eip" "NAT_Instance_eip" {
 }
 
 # Private Subnet Routing Table ( dest: NAT Instance ENI )
-data "aws_route_table" "private_1" {
-  subnet_id  = module.vpc.private_subnets[0]
-  depends_on = [module.vpc]
-}
-
-data "aws_route_table" "private_2" {
-  subnet_id  = module.vpc.private_subnets[1]
-  depends_on = [module.vpc]
-}
-
+#  - 예전에는 data "aws_route_table" + depends_on = [module.vpc]로 서브넷의 라우팅 테이블을 조회했지만,
+#    VPC에 아주 작은 변경만 있어도 조회가 apply 때로 미뤄져 아래 NAT 경로가 "삭제 후 재생성"되는 문제가 있었습니다.
+#    (경로가 지워진 순간 private 서브넷의 노드가 인터넷에 못 나감)
+#  - VPC 모듈이 private 서브넷마다 라우팅 테이블을 하나씩 만들고 같은 순서로 연결하므로,
+#    모듈 Output(private_route_table_ids)을 바로 씁니다. [0] → private 서브넷 1, [1] → private 서브넷 2
 resource "aws_route" "private_subnet_1" {
-  route_table_id         = data.aws_route_table.private_1.id
+  route_table_id         = module.vpc.private_route_table_ids[0]
   destination_cidr_block = "0.0.0.0/0"
   network_interface_id   = aws_network_interface.NAT_ENI.id
   depends_on             = [module.vpc, aws_instance.NAT_Instance]
 }
 
 resource "aws_route" "private_subnet_2" {
-  route_table_id         = data.aws_route_table.private_2.id
+  route_table_id         = module.vpc.private_route_table_ids[1]
   destination_cidr_block = "0.0.0.0/0"
   network_interface_id   = aws_network_interface.NAT_ENI.id
   depends_on             = [module.vpc, aws_instance.NAT_Instance]
@@ -273,18 +280,19 @@ module "eks" {
   enable_cluster_creator_admin_permissions = true
 }
 
-// Private Subnet Tag ( AWS Load Balancer Controller Tag / internal )
-resource "aws_ec2_tag" "private_subnet_tag" {
-  for_each    = { for idx, subnet in module.vpc.private_subnets : idx => subnet }
-  resource_id = each.value
-  key         = "kubernetes.io/role/internal-elb"
-  value       = "1"
+# 서브넷 태그(AWS Load Balancer Controller용)는 위 VPC 모듈의 public_subnet_tags / private_subnet_tags로 옮겼습니다.
+# 예전 aws_ec2_tag 리소스는 Terraform 관리 대상에서만 빼고, 실제 서브넷의 태그는 지우지 않습니다 (destroy = false).
+# 이미 apply된 환경에서 한 번 적용된 뒤에는 이 removed 블록을 지워도 됩니다.
+removed {
+  from = aws_ec2_tag.private_subnet_tag
+  lifecycle {
+    destroy = false
+  }
 }
 
-// Public Subnet Tag (AWS Load Balancer Controller Tag / internet-facing)
-resource "aws_ec2_tag" "public_subnet_tag" {
-  for_each    = { for idx, subnet in module.vpc.public_subnets : idx => subnet }
-  resource_id = each.value
-  key         = "kubernetes.io/role/elb"
-  value       = "1"
+removed {
+  from = aws_ec2_tag.public_subnet_tag
+  lifecycle {
+    destroy = false
+  }
 }
