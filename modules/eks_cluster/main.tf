@@ -332,9 +332,10 @@ locals {
     # 2) iptables 설치 - EIP가 붙기 전에는 인터넷이 안 되므로 성공할 때까지 재시도
     until dnf install -y iptables-services; do sleep 10; done
 
-    # 3) VPC 대역(${local.cidr})에서 나가는 트래픽을 NAT 인스턴스 IP로 변환(MASQUERADE)
-    IFACE=$(ip route show default | awk '{print $5}' | head -n1)
-    iptables -t nat -A POSTROUTING -o "$IFACE" -s ${local.cidr} -j MASQUERADE
+    # 3) VPC 대역(${local.cidr})에서 와서 VPC 밖으로 나가는 트래픽을 NAT 인스턴스 IP로 변환(MASQUERADE)
+    #    - 인터페이스 이름(-o enX0 / ens5)을 규칙에 넣지 않음: 인스턴스 타입을 바꾸면 이름이 달라짐
+    #      (t2 = Xen → enX0, t3 = Nitro → ens5). 예전에는 이름을 넣어서 t2 → t3 변경 후 NAT가 동작하지 않았음
+    iptables -t nat -A POSTROUTING -s ${local.cidr} ! -d ${local.cidr} -j MASQUERADE
     iptables -F FORWARD
 
     # 4) 규칙 저장 후 iptables 서비스 활성화 (재부팅 후에도 규칙 유지)
@@ -427,7 +428,7 @@ resource "aws_network_interface" "NAT_ENI" {
 #  - NAT가 동작하려면 ENI의 source_dest_check = false 설정도 필요합니다 (위 NAT_ENI에 설정되어 있음).
 resource "aws_instance" "NAT_Instance" {
   ami           = data.aws_ssm_parameter.al2023_ami.insecure_value
-  instance_type = "t2.micro"
+  instance_type = "t3.micro"
   depends_on    = [aws_network_interface.NAT_ENI]
 
   network_interface {
@@ -438,6 +439,9 @@ resource "aws_instance" "NAT_Instance" {
   # 스크립트 내용은 위 locals의 nat_user_data 참고
   # replace(..., "\r", ""): Windows에서 파일이 CRLF로 저장돼도 Linux에서 스크립트가 실행되도록 \r 제거
   user_data = replace(local.nat_user_data, "\r", "")
+  # user_data는 처음 부팅 때만 실행되므로, 스크립트를 바꾸면 인스턴스를 새로 만들도록 설정
+  # (이 설정이 없으면 Terraform이 스크립트만 덮어쓰고 재시작해서, 바뀐 스크립트가 실행되지 않음)
+  user_data_replace_on_change = true
 
   tags = {
     Name = "NAT_Instance"
