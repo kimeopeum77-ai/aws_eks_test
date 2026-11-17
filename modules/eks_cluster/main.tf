@@ -143,23 +143,42 @@ resource "aws_iam_instance_profile" "BastionHost_profile" {
 locals {
   bastion_user_data = <<-EOF
     #!/bin/bash
-    set -euxo pipefail
+    # set -e는 쓰지 않음: 한 단계(예: k9s 다운로드)가 실패해도 나머지 단계는 계속 실행되도록
+    # (예전에는 GitHub 다운로드가 한 번 끊기자 kubeconfig 등록까지 건너뛰는 문제가 있었음)
+    set -uxo pipefail
     exec > /var/log/bastion-init.log 2>&1
 
-    # 1) kubectl - 클러스터 버전(${local.cluster_version})과 같은 마이너 버전의 최신 패치를 설치
-    #    (kubectl은 클러스터와 마이너 버전 ±1까지만 지원)
-    KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable-${local.cluster_version}.txt)
-    curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl"
-    curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl.sha256"
-    echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum --check   # 체크섬 검증
-    chmod +x /usr/local/bin/kubectl
+    # 다운로드 공통 옵션: 네트워크 오류(연결 끊김 등) 시 5초 간격으로 5번 재시도
+    CURL="curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 10"
+    FAILED=""
 
-    # 2) k9s - GitHub 최신 릴리스 설치
-    curl -fsSL https://github.com/derailed/k9s/releases/latest/download/k9s_Linux_amd64.tar.gz | tar -xz -C /usr/local/bin k9s
-    chmod +x /usr/local/bin/k9s
+    # 1) ec2-user의 kubeconfig에 EKS 클러스터 등록 (가장 중요하므로 먼저 실행)
+    #    - IAM Role 자격 증명 사용, alias로 짧은 이름(${local.cluster_name}) 지정
+    #    - 새로 만든 IAM Role 자격 증명이 늦게 전달될 수 있어 실패하면 15초 간격으로 최대 10번 재시도
+    for i in $(seq 1 10); do
+      sudo -u ec2-user aws eks update-kubeconfig --region ${local.region} --name ${local.cluster_name} --alias ${local.cluster_name} && break
+      echo "update-kubeconfig 실패 ($i/10), 15초 후 재시도"; sleep 15
+    done
+    [ -f /home/ec2-user/.kube/config ] || FAILED="$FAILED kubeconfig"
 
-    # 3) ec2-user의 kubeconfig에 EKS 클러스터 등록 (IAM Role 자격 증명 사용, alias로 짧은 이름 지정)
-    sudo -u ec2-user aws eks update-kubeconfig --region ${local.region} --name ${local.cluster_name} --alias ${local.cluster_name}
+    # 2) kubectl - 클러스터 버전(${local.cluster_version})과 같은 마이너 버전의 최신 패치를 설치
+    #    (kubectl은 클러스터와 마이너 버전 ±1까지만 지원 / 체크섬이 맞을 때만 설치)
+    install_kubectl() {
+      KUBECTL_VERSION=$($CURL https://dl.k8s.io/release/stable-${local.cluster_version}.txt) || return 1
+      $CURL -o /tmp/kubectl "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl" || return 1
+      $CURL -o /tmp/kubectl.sha256 "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl.sha256" || return 1
+      echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum --check || return 1
+      install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+    }
+    install_kubectl || FAILED="$FAILED kubectl"
+
+    # 3) k9s - GitHub 최신 릴리스 설치 (파일로 먼저 받은 뒤 압축 해제)
+    install_k9s() {
+      $CURL -o /tmp/k9s.tar.gz https://github.com/derailed/k9s/releases/latest/download/k9s_Linux_amd64.tar.gz || return 1
+      tar -xzf /tmp/k9s.tar.gz -C /tmp k9s || return 1
+      install -m 0755 /tmp/k9s /usr/local/bin/k9s
+    }
+    install_k9s || FAILED="$FAILED k9s"
 
     # 4) 편의 설정 - kubectl 자동완성 + 'k' 별칭
     cat >> /home/ec2-user/.bashrc <<'BASHRC'
@@ -167,6 +186,10 @@ locals {
     alias k=kubectl
     complete -o default -F __start_kubectl k
     BASHRC
+
+    # 결과 요약 - 실패한 단계가 있으면 로그 마지막 줄에 표시되고, cloud-init도 실패로 기록됨
+    if [ -n "$FAILED" ]; then echo "[실패한 단계]$FAILED"; exit 1; fi
+    echo "[완료] kubeconfig / kubectl / k9s 설치 성공"
   EOF
 
   # NAT 인스턴스 부팅 스크립트 - IP 포워딩 + iptables MASQUERADE
@@ -202,7 +225,8 @@ resource "aws_instance" "BastionHost" {
   associate_public_ip_address = true
   vpc_security_group_ids      = [module.BastionHost_SG.security_group_id, module.eks.cluster_primary_security_group_id]
   iam_instance_profile        = aws_iam_instance_profile.BastionHost_profile.name
-  depends_on                  = [module.eks]
+  # EKS 클러스터와 eks:DescribeCluster 권한이 모두 만들어진 뒤에 Bastion을 생성 (부팅 스크립트가 바로 사용하므로)
+  depends_on = [module.eks, aws_iam_role_policy.BastionHost_eks_describe]
 
   # 부팅 시 kubectl / k9s 설치 + kubeconfig 등록 (처음 부팅할 때 한 번만 실행됨)
   #  - 실행 로그: /var/log/bastion-init.log
