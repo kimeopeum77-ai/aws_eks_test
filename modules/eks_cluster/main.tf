@@ -180,6 +180,70 @@ locals {
     }
     install_k9s || FAILED="$FAILED k9s"
 
+    # 3-1) 추가 편의 도구 (모두 GitHub / 공식 배포처의 최신 릴리스)
+    #    - kubectx / kubens : context / namespace 빠르게 전환 (예: kubens kube-system)
+    #    - fzf  : 퍼지 검색 (Ctrl+R 명령 기록 검색, kubectx/kubens 인자 없이 실행하면 목록에서 선택)
+    #    - helm : Kubernetes 패키지 매니저 (AWS Load Balancer Controller 등 설치에 사용)
+    #    - stern: 여러 파드 로그를 한 번에 보기 (예: stern -n kube-system coredns)
+    #    ※ $${...} / %%{...}는 Terraform이 아닌 셸 문법을 그대로 쓰기 위한 이스케이프
+    gh_latest() {   # GitHub 최신 릴리스 태그(예: v0.11.0) 조회
+      $CURL -I -o /dev/null -w '%%{url_effective}' "https://github.com/$1/releases/latest" | sed 's#.*/tag/##'
+    }
+    install_kubectx() {
+      v=$(gh_latest ahmetb/kubectx) || return 1
+      for t in kubectx kubens; do
+        $CURL -o /tmp/$t.tar.gz "https://github.com/ahmetb/kubectx/releases/download/$v/$${t}_$${v}_linux_x86_64.tar.gz" || return 1
+        tar -xzf /tmp/$t.tar.gz -C /tmp $t || return 1
+        install -m 0755 /tmp/$t /usr/local/bin/$t || return 1
+      done
+    }
+    install_fzf() {
+      v=$(gh_latest junegunn/fzf) || return 1
+      $CURL -o /tmp/fzf.tar.gz "https://github.com/junegunn/fzf/releases/download/$v/fzf-$${v#v}-linux_amd64.tar.gz" || return 1
+      tar -xzf /tmp/fzf.tar.gz -C /tmp fzf || return 1
+      install -m 0755 /tmp/fzf /usr/local/bin/fzf
+    }
+    install_helm() {
+      HV=$($CURL https://get.helm.sh/helm-latest-version) || return 1
+      $CURL -o /tmp/helm.tar.gz "https://get.helm.sh/helm-$${HV}-linux-amd64.tar.gz" || return 1
+      tar -xzf /tmp/helm.tar.gz -C /tmp linux-amd64/helm || return 1
+      install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+    }
+    install_stern() {
+      v=$(gh_latest stern/stern) || return 1
+      $CURL -o /tmp/stern.tar.gz "https://github.com/stern/stern/releases/download/$v/stern_$${v#v}_linux_amd64.tar.gz" || return 1
+      tar -xzf /tmp/stern.tar.gz -C /tmp stern || return 1
+      install -m 0755 /tmp/stern /usr/local/bin/stern
+    }
+    # 3-2) EKS / 출력 편의 도구
+    #    - eksctl   : EKS 관리 CLI (IRSA용 eksctl create iamserviceaccount, 노드 그룹 / 애드온 관리)
+    #    - jq / yq  : JSON / YAML에서 필요한 값만 뽑기 (예: kubectl get pod -o json | jq '.items[].metadata.name')
+    #    - kubecolor: kubectl 출력에 색 표시 (zsh에서 kubectl → kubecolor 별칭, 자동완성은 그대로)
+    install_eksctl() {
+      $CURL -o /tmp/eksctl.tar.gz https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz || return 1
+      tar -xzf /tmp/eksctl.tar.gz -C /tmp eksctl || return 1
+      install -m 0755 /tmp/eksctl /usr/local/bin/eksctl
+    }
+    install_jq_yq() {
+      dnf install -y jq || return 1
+      $CURL -o /tmp/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 || return 1
+      install -m 0755 /tmp/yq /usr/local/bin/yq
+    }
+    install_kubecolor() {
+      v=$(gh_latest kubecolor/kubecolor) || return 1
+      $CURL -o /tmp/kubecolor.tar.gz "https://github.com/kubecolor/kubecolor/releases/download/$v/kubecolor_$${v#v}_linux_amd64.tar.gz" || return 1
+      tar -xzf /tmp/kubecolor.tar.gz -C /tmp kubecolor || return 1
+      install -m 0755 /tmp/kubecolor /usr/local/bin/kubecolor
+    }
+    install_eksctl || FAILED="$FAILED eksctl"
+    install_jq_yq || FAILED="$FAILED jq/yq"
+    install_kubecolor || FAILED="$FAILED kubecolor"
+
+    install_kubectx || FAILED="$FAILED kubectx"
+    install_fzf || FAILED="$FAILED fzf"
+    install_helm || FAILED="$FAILED helm"
+    install_stern || FAILED="$FAILED stern"
+
     # 4) 편의 설정 - kubectl 자동완성 + 'k' 별칭
     cat >> /home/ec2-user/.bashrc <<'BASHRC'
     source <(kubectl completion bash)
@@ -187,9 +251,75 @@ locals {
     complete -o default -F __start_kubectl k
     BASHRC
 
+    # 5) zsh + oh-my-zsh + Powerlevel10k(p10k) + Kubernetes 플러그인
+    #    - oh-my-zsh 플러그인
+    #        kubectl : 자동완성 + k, kgp(get pods), kgs(get svc), kaf(apply -f) 같은 별칭
+    #        helm    : helm 자동완성          aws : aws CLI 자동완성        git : git 별칭
+    #        fzf     : Ctrl+R 명령 기록 퍼지 검색, Ctrl+T 파일 검색
+    #        sudo    : ESC 두 번 → 방금 명령 앞에 sudo 붙이기
+    #        z       : 자주 가는 디렉터리로 바로 이동 (예: z aws)
+    #        extract : 압축 종류 상관없이 'extract 파일명'으로 풀기
+    #        colored-man-pages : man 페이지 색 표시
+    #        zsh-autosuggestions(이전 명령 추천 → 오른쪽 화살표로 입력), zsh-syntax-highlighting(명령 색 표시)
+    #    - p10k 테마는 lean 스타일 기본 설정을 쓰고, 프롬프트 오른쪽에 현재 k8s context / namespace를 항상 표시
+    #    - 설치 스크립트를 원격 실행하지 않고 git clone으로 직접 받음 (실패하면 5번 재시도)
+    clone() {
+      for n in 1 2 3 4 5; do
+        rm -rf "$2"
+        git clone --depth=1 "$1" "$2" && return 0
+        echo "git clone 실패 ($n/5): $1"; sleep 5
+      done
+      return 1
+    }
+    install_zsh() {
+      dnf install -y zsh git || return 1
+      H=/home/ec2-user
+      ZC=$H/.oh-my-zsh/custom
+      clone https://github.com/ohmyzsh/ohmyzsh.git $H/.oh-my-zsh || return 1
+      clone https://github.com/romkatv/powerlevel10k.git $ZC/themes/powerlevel10k || return 1
+      clone https://github.com/zsh-users/zsh-autosuggestions.git $ZC/plugins/zsh-autosuggestions || return 1
+      clone https://github.com/zsh-users/zsh-syntax-highlighting.git $ZC/plugins/zsh-syntax-highlighting || return 1
+
+      # p10k 설정: lean 템플릿 사용 + kubecontext를 kubectl 입력 때만이 아니라 항상 표시
+      cp $ZC/themes/powerlevel10k/config/p10k-lean.zsh $H/.p10k.zsh
+      sed -i 's/^\(\s*\)\(typeset -g POWERLEVEL9K_KUBECONTEXT_SHOW_ON_COMMAND=\)/\1# \2/' $H/.p10k.zsh
+
+      cat > $H/.zshrc <<'ZSHRC'
+    # p10k 설정 마법사(p10k configure)를 자동으로 띄우지 않음 - 다시 설정하려면 'p10k configure' 실행
+    POWERLEVEL9K_DISABLE_CONFIGURATION_WIZARD=true
+
+    export ZSH="$HOME/.oh-my-zsh"
+    ZSH_THEME="powerlevel10k/powerlevel10k"
+    plugins=(git aws kubectl helm fzf sudo z extract colored-man-pages zsh-autosuggestions zsh-syntax-highlighting)
+    export PATH=/usr/local/bin:$PATH
+
+    source $ZSH/oh-my-zsh.sh
+    [[ -f ~/.p10k.zsh ]] && source ~/.p10k.zsh
+
+    # kubectl 출력에 색 표시 (kubecolor), 자동완성은 kubectl 것을 그대로 사용
+    if command -v kubecolor >/dev/null; then
+      alias kubectl=kubecolor
+      compdef kubecolor=kubectl
+    fi
+
+    # eksctl 자동완성
+    command -v eksctl >/dev/null && source <(eksctl completion zsh)
+
+    # 추가 별칭
+    alias kx=kubectx      # context 전환
+    alias kn=kubens       # namespace 전환
+    alias kgpa='kubectl get pods -A'
+    alias kevents='kubectl get events -A --sort-by=.lastTimestamp'
+    ZSHRC
+
+      chown -R ec2-user:ec2-user $H/.oh-my-zsh $H/.p10k.zsh $H/.zshrc
+      usermod -s /bin/zsh ec2-user   # ec2-user 기본 셸을 zsh로 변경
+    }
+    install_zsh || FAILED="$FAILED zsh"
+
     # 결과 요약 - 실패한 단계가 있으면 로그 마지막 줄에 표시되고, cloud-init도 실패로 기록됨
     if [ -n "$FAILED" ]; then echo "[실패한 단계]$FAILED"; exit 1; fi
-    echo "[완료] kubeconfig / kubectl / k9s 설치 성공"
+    echo "[완료] kubeconfig / kubectl / k9s / eksctl / jq / yq / kubecolor / kubectx / fzf / helm / stern / zsh + p10k 설치 성공"
   EOF
 
   # NAT 인스턴스 부팅 스크립트 - IP 포워딩 + iptables MASQUERADE
